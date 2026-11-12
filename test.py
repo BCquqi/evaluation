@@ -5,7 +5,6 @@
 from __future__ import annotations
 
 import argparse
-import ctypes
 import os
 import shlex
 import shutil
@@ -22,25 +21,6 @@ try:
     import psutil  # type: ignore[import-not-found]  # pyright: ignore[reportMissingImports,reportMissingModuleSource]
 except ImportError:  # psutil is optional; memory monitoring is skipped without it.
     psutil = None
-
-
-def _setup_windows_console() -> None:
-    """Force UTF-8 console output and disable crash dialogs on Windows."""
-    if sys.platform != "win32":
-        return
-    ctypes.windll.kernel32.SetConsoleCP(65001)
-    ctypes.windll.kernel32.SetConsoleOutputCP(65001)
-    os.environ["PYTHONIOENCODING"] = "utf-8"
-    sys.stdout.reconfigure(encoding="utf-8", errors="replace")  # pyright: ignore[reportAttributeAccessIssue]
-    sys.stderr.reconfigure(encoding="utf-8", errors="replace")  # pyright: ignore[reportAttributeAccessIssue]
-    
-    # Disable Windows Error Reporting (WER) dialogs for child processes.
-    # This prevents the system from hanging while waiting for user input when a
-    # submission segfaults, allowing the evaluator to catch the RE immediately.
-    ctypes.windll.kernel32.SetErrorMode(0x0001 | 0x0002 | 0x8000)
-
-
-_setup_windows_console()
 
 
 PARENT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -70,10 +50,10 @@ RUN_POLL_INTERVAL_SECONDS = 0.02
 def _default_static_flag() -> str:
     """Return the static-link flag appropriate for the current platform.
     
-    macOS and Windows typically don't need or support -static for local
-    compilation in the same way Linux does, so we default to empty there.
+    macOS typically doesn't support -static for local compilation, so we
+    default to empty there.
     """
-    return NOI_STATIC_FLAG if sys.platform.startswith("linux") else ""
+    return NOI_STATIC_FLAG if sys.platform != "darwin" else ""
 
 
 class Problem(NamedTuple):
@@ -190,7 +170,7 @@ def run_program(
     proc: Optional[subprocess.Popen] = None
     try:
         # Copy the input file into the work dir when the problem expects
-        # file-based I/O.
+        # file-based I/O (e.g., freopen).
         if input_name != "-":
             shutil.copy2(in_file, os.path.join(work_dir, input_name))
 
@@ -202,11 +182,10 @@ def run_program(
                 os.remove(expected_output)
 
         # Crucial: Open files in BINARY mode ("rb" and "wb").
-        # On Windows, text mode ("r" and "w") automatically translates "\r\n"
-        # to "\n" and vice versa. This corrupts the byte stream compared to
-        # the Linux judge environment.
-        with open(in_file, "rb") as fin, \
-             open(out_file, "wb") as fout:
+        # Text mode ("r" and "w") automatically translates line endings on
+        # some platforms, corrupting the byte stream compared to the Linux
+        # judge environment.
+        with open(in_file, "rb") as fin, open(out_file, "wb") as fout:
             start = time.time()
             # Do NOT use stderr=PIPE here: a program writing lots of debug
             # output to stderr would fill the pipe buffer and block forever,
@@ -260,13 +239,13 @@ def compare_files(student_output: str, expected_output: str) -> bool:
     1. Ignore trailing spaces on each line.
     2. Ignore trailing newlines at the end of the file.
     3. Leading whitespace and interior blank lines are strictly compared.
-    4. CRLF and LF differences are normalized to prevent Windows-specific WA.
+    4. CRLF and LF differences are normalized to prevent cross-platform WA.
     """
     def read_normalized(path: str) -> list[bytes]:
         with open(path, "rb") as f:
             content = f.read()
         
-        # Normalize all line endings to \n. This removes Windows CRLF
+        # Normalize all line endings to \n. This removes CRLF
         # differences and ensures cross-platform consistency.
         content = content.replace(b"\r\n", b"\n")
         
@@ -288,42 +267,15 @@ def compare_files(student_output: str, expected_output: str) -> bool:
         return False
 
 
-def cleanup_problem_artifacts(
-    prob_dir: str,
-    data_dir: str,
-    problem_name: str,
-    input_name: str,
-    output_name: str,
-) -> None:
-    """Remove artifacts generated during evaluation for a single problem."""
-    filenames: set[str] = {f"{problem_name}.exe"}
-    if input_name != "-":
-        filenames.add(input_name)
-    if output_name != "-":
-        filenames.add(output_name)
-
+def cleanup_problem_artifacts(prob_dir: str, problem_name: str) -> None:
+    """Remove the executable generated during evaluation."""
+    exe_path = os.path.join(prob_dir, problem_name)
     try:
-        data_files = os.listdir(data_dir)
-    except OSError:
-        data_files = []
-
-    # Also remove any testcase I/O files copied into the problem directory.
-    for filename in data_files:
-        stem, extension = os.path.splitext(filename)
-        if filename.startswith(problem_name) and extension == ".in" and stem[len(problem_name):].isdigit():
-            filenames.add(filename)
-            filenames.add(stem + ".out")
-
-    for filename in filenames:
-        if filename == "-" or os.path.basename(filename) != filename:
-            continue
-        target = os.path.join(prob_dir, filename)
-        try:
-            os.remove(target)
-        except FileNotFoundError:
-            pass
-        except OSError as error:
-            print(f"Cleanup failed {target}: {error}", file=sys.stderr)
+        os.remove(exe_path)
+    except FileNotFoundError:
+        pass
+    except OSError as error:
+        print(f"Cleanup failed {exe_path}: {error}", file=sys.stderr)
 
 
 def run_testcase(
@@ -338,6 +290,8 @@ def run_testcase(
 ) -> str:
     """Run one testcase in an isolated temp dir and return its verdict."""
     try:
+        # Use an isolated temporary directory for each testcase so that
+        # submissions using freopen() won't overwrite each other.
         with tempfile.TemporaryDirectory(prefix="oj_case_") as work_dir:
             out_file = os.path.join(work_dir, in_file.replace(".in", ".out"))
             status, _ = run_program(
@@ -383,8 +337,9 @@ def evaluate_student(
     for problem in problems:
         p_name, tle, mle, input_name, output_name = problem
         prob_dir = os.path.join(folder_path, p_name)
-        if os.path.isdir(prob_dir):
-            cleanup_problem_artifacts(prob_dir, data_dir, p_name, input_name, output_name)
+        
+        # Clean up previous run's executable
+        cleanup_problem_artifacts(prob_dir, p_name)
 
         cpp_path = os.path.join(prob_dir, p_name + ".cpp")
 
@@ -400,11 +355,11 @@ def evaluate_student(
                 print(f"  {p_name}: NO_CPP")
             continue
 
-        # Compile the submission with the configured standard and flags.
-        exe_path = os.path.join(prob_dir, p_name + ".exe")
+        # Output executable without .exe for Linux purity
+        exe_path = os.path.join(prob_dir, p_name)
         ok, _ = compile_cpp(cpp_path, exe_path, cxx_standard, opt_flags, static_flag)
         if not ok:
-            cleanup_problem_artifacts(prob_dir, data_dir, p_name, input_name, output_name)
+            cleanup_problem_artifacts(prob_dir, p_name)
             set_problem_result(p_name, "CE")
             if not quiet:
                 print(f"  {p_name}: CE")
@@ -422,7 +377,7 @@ def evaluate_student(
         )
 
         if not in_files:
-            cleanup_problem_artifacts(prob_dir, data_dir, p_name, input_name, output_name)
+            cleanup_problem_artifacts(prob_dir, p_name)
             set_problem_result(p_name, "NO_TESTCASES")
             if not quiet:
                 print(f"  {p_name}: NO_TESTCASES")
@@ -474,7 +429,7 @@ def evaluate_student(
             )
 
         set_problem_result(p_name, problem_status, score)
-        cleanup_problem_artifacts(prob_dir, data_dir, p_name, input_name, output_name)
+        cleanup_problem_artifacts(prob_dir, p_name)
 
         if not quiet:
             print(f"  {p_name}: {problem_status} {score}/{PROBLEM_POINTS}")
@@ -643,6 +598,8 @@ def parse_args() -> argparse.Namespace:
 
     # Compile settings. Each defaults to the NOI Linux 2.0 value, so leaving
     # them untouched reproduces the original behavior.
+    default_static = _default_static_flag()
+
     parser.add_argument(
         "--cxx-standard",
         default=NOI_CXX_STANDARD,
@@ -658,10 +615,10 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--static-flag",
-        default=_default_static_flag(),
+        default=default_static,
         help=(
             "Static-link flag. Pass an empty string to disable. "
-            f"Default on this platform: {_default_static_flag()!r}."
+            f"Default on this platform: {default_static!r}."
         ),
     )
 
