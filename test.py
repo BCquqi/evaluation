@@ -26,14 +26,19 @@ except ImportError:  # psutil is optional; memory monitoring is skipped without 
 
 
 def _setup_windows_console() -> None:
-    """Force UTF-8 console output on Windows."""
+    """Force UTF-8 console output and disable crash dialogs on Windows."""
     if sys.platform != "win32":
         return
     ctypes.windll.kernel32.SetConsoleCP(65001)
     ctypes.windll.kernel32.SetConsoleOutputCP(65001)
     os.environ["PYTHONIOENCODING"] = "utf-8"
-    sys.stdout.reconfigure(encoding="utf-8", errors="replace") # pyright: ignore[reportAttributeAccessIssue]
-    sys.stderr.reconfigure(encoding="utf-8", errors="replace") # pyright: ignore[reportAttributeAccessIssue]
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")  # pyright: ignore[reportAttributeAccessIssue]
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")  # pyright: ignore[reportAttributeAccessIssue]
+    
+    # Disable Windows Error Reporting (WER) dialogs for child processes.
+    # This prevents the system from hanging while waiting for user input when a
+    # submission segfaults, allowing the evaluator to catch the RE immediately.
+    ctypes.windll.kernel32.SetErrorMode(0x0001 | 0x0002 | 0x8000)
 
 
 _setup_windows_console()
@@ -65,11 +70,11 @@ RUN_POLL_INTERVAL_SECONDS = 0.02
 
 def _default_static_flag() -> str:
     """Return the static-link flag appropriate for the current platform.
-
-    macOS's default toolchain does not support -static, so we start with an
-    empty string there. Users can still pass --static-flag explicitly.
+    
+    macOS and Windows typically don't need or support -static for local
+    compilation in the same way Linux does, so we default to empty there.
     """
-    return "" if sys.platform == "darwin" else NOI_STATIC_FLAG
+    return NOI_STATIC_FLAG if sys.platform.startswith("linux") else ""
 
 
 class Problem(NamedTuple):
@@ -119,8 +124,6 @@ def compile_cpp(
     opt_flags is a shell-like string; shlex.split turns it into an argv list
     so multiple flags (e.g. "-O2 -Wall") can be supplied in one argument.
     An empty static_flag disables static linking.
-
-    Returns (True, "") on success, or (False, error_message) on failure.
     """
     command = ["g++"]
     if cxx_standard:
