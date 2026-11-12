@@ -15,8 +15,7 @@ import tempfile
 import time
 import zipfile
 from datetime import datetime
-from itertools import zip_longest
-from typing import Iterator, NamedTuple, Optional
+from typing import NamedTuple, Optional
 from xml.sax.saxutils import escape
 
 try:
@@ -202,8 +201,12 @@ def run_program(
             if os.path.exists(expected_output):
                 os.remove(expected_output)
 
-        with open(in_file, "r", encoding="utf-8", errors="replace") as fin, \
-             open(out_file, "w", encoding="utf-8", errors="replace") as fout:
+        # Crucial: Open files in BINARY mode ("rb" and "wb").
+        # On Windows, text mode ("r" and "w") automatically translates "\r\n"
+        # to "\n" and vice versa. This corrupts the byte stream compared to
+        # the Linux judge environment.
+        with open(in_file, "rb") as fin, \
+             open(out_file, "wb") as fout:
             start = time.time()
             # Do NOT use stderr=PIPE here: a program writing lots of debug
             # output to stderr would fill the pipe buffer and block forever,
@@ -251,41 +254,36 @@ def run_program(
 
 
 def compare_files(student_output: str, expected_output: str) -> bool:
-    """Compare two output files using the NOI filtering rule.
-
-    Trailing whitespace on each line and trailing blank lines at the end of
-    the file are ignored. Interior blank lines and leading whitespace are
-    significant and cause a WA if mismatched.
+    """Compare two output files using the strict NOI filtering rule.
+    
+    Rules implemented:
+    1. Ignore trailing spaces on each line.
+    2. Ignore trailing newlines at the end of the file.
+    3. Leading whitespace and interior blank lines are strictly compared.
+    4. CRLF and LF differences are normalized to prevent Windows-specific WA.
     """
-
-    def normalized_lines(path: str) -> Iterator[object]:
-        with open(path, "rb") as stream:
-            pending_blank = 0
-            for raw_line in stream:
-                line = raw_line.rstrip(b" \r\n")
-                if not line:
-                    pending_blank += 1
-                    continue
-                # Any interior blank line must force a mismatch, even when the
-                # reference has a blank line at the same position. Yield a
-                # fresh object() per blank line; object() compares by
-                # identity, so no two markers are ever equal.
-                for _ in range(pending_blank):
-                    yield object()
-                pending_blank = 0
-                yield line  # Leading whitespace is kept: NOI forbids it.
-            # Trailing blank lines are silently dropped (NOI rule).
+    def read_normalized(path: str) -> list[bytes]:
+        with open(path, "rb") as f:
+            content = f.read()
+        
+        # Normalize all line endings to \n. This removes Windows CRLF
+        # differences and ensures cross-platform consistency.
+        content = content.replace(b"\r\n", b"\n")
+        
+        lines = content.split(b"\n")
+        
+        # Strip trailing spaces from each line (NOI rule).
+        # Leading spaces are preserved to catch formatting errors.
+        lines = [line.rstrip(b" ") for line in lines]
+        
+        # Drop trailing empty lines (NOI rule: ignore file-ending newlines).
+        while lines and not lines[-1]:
+            lines.pop()
+            
+        return lines
 
     try:
-        sentinel = object()
-        return all(
-            left == right
-            for left, right in zip_longest(
-                normalized_lines(student_output),
-                normalized_lines(expected_output),
-                fillvalue=sentinel,
-            )
-        )
+        return read_normalized(student_output) == read_normalized(expected_output)
     except Exception:
         return False
 
