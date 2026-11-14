@@ -8,6 +8,7 @@ import argparse
 import os
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -19,8 +20,14 @@ from xml.sax.saxutils import escape
 
 try:
     import psutil  # type: ignore[import-not-found]  # pyright: ignore[reportMissingImports,reportMissingModuleSource]
-except ImportError:  # psutil is optional; memory monitoring is skipped without it.
+except ImportError:  # psutil is optional; it only backs the platform fallbacks.
     psutil = None
+
+if sys.platform == "win32":
+    import ctypes
+    from ctypes import wintypes
+else:
+    import resource
 
 
 PARENT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -44,7 +51,99 @@ NOI_OPT_FLAGS = "-O2"
 NOI_STATIC_FLAG = "-static"
 
 COMPILE_TIMEOUT_SECONDS = 30
-RUN_POLL_INTERVAL_SECONDS = 0.02
+RUN_POLL_INTERVAL_SECONDS = 0.005
+
+# NOI judges measure CPU time (user+system) against the time limit and peak
+# resident memory against the memory limit, both read after the process exits.
+# Wall-clock is used only as an emergency brake, so that a blocked or sleeping
+# submission cannot hang the whole evaluation run. It never produces a verdict
+# on its own unless the CPU-time reading is unavailable.
+WALL_CLOCK_FACTOR = 3.0
+WALL_CLOCK_SLACK_SECONDS = 5.0
+
+# A hard OS ceiling that stops a runaway submission from exhausting the host.
+# This is deliberately far above the judged limit: when it fires the process
+# merely fails to allocate, which is indistinguishable from a normal exit, so
+# it can only ever be a safety net. The memory verdict comes from the kernel's
+# recorded peak instead.
+MEMORY_SAFETY_FACTOR = 4
+MEMORY_SAFETY_MIN_MB = 1024
+MEMORY_SAFETY_MAX_MB = 2048
+
+# Windows Job Object layout. Queried after the run for PeakProcessMemoryUsed,
+# the kernel's exact high-water mark for the process (not a sample).
+if sys.platform == "win32":
+    _JOB_OBJECT_LIMIT_PROCESS_MEMORY = 0x00000100
+    _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
+    _JOB_OBJECT_EXTENDED_LIMIT_INFORMATION = 9
+    _PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    _PROCESS_TERMINATE = 0x0001
+    _PROCESS_SET_QUOTA = 0x0100
+    _SEM_FAILCRITICALERRORS = 0x0001
+    _SEM_NOGPFAULTERRORBOX = 0x0002
+    _CREATE_NO_WINDOW = 0x08000000
+
+    _kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+    # Without this a crashing submission blocks on a Windows Error Reporting
+    # dialog and gets misread as TLE by the wall-clock brake.
+    _kernel32.SetErrorMode(_SEM_FAILCRITICALERRORS | _SEM_NOGPFAULTERRORBOX)
+
+    class _IO_COUNTERS(ctypes.Structure):
+        _fields_ = [
+            ("ReadOperationCount", ctypes.c_ulonglong),
+            ("WriteOperationCount", ctypes.c_ulonglong),
+            ("OtherOperationCount", ctypes.c_ulonglong),
+            ("ReadTransferCount", ctypes.c_ulonglong),
+            ("WriteTransferCount", ctypes.c_ulonglong),
+            ("OtherTransferCount", ctypes.c_ulonglong),
+        ]
+
+    class _JOBOBJECT_BASIC_LIMIT_INFORMATION(ctypes.Structure):
+        _fields_ = [
+            ("PerProcessUserTimeLimit", ctypes.c_int64),
+            ("PerJobUserTimeLimit", ctypes.c_int64),
+            ("LimitFlags", wintypes.DWORD),
+            ("MinimumWorkingSetSize", ctypes.c_size_t),
+            ("MaximumWorkingSetSize", ctypes.c_size_t),
+            ("ActiveProcessLimit", wintypes.DWORD),
+            ("Affinity", ctypes.c_size_t),
+            ("PriorityClass", wintypes.DWORD),
+            ("SchedulingClass", wintypes.DWORD),
+        ]
+
+    class _JOBOBJECT_EXTENDED_LIMIT_INFORMATION(ctypes.Structure):
+        _fields_ = [
+            ("BasicLimitInformation", _JOBOBJECT_BASIC_LIMIT_INFORMATION),
+            ("IoInfo", _IO_COUNTERS),
+            ("ProcessMemoryLimit", ctypes.c_size_t),
+            ("JobMemoryLimit", ctypes.c_size_t),
+            ("PeakProcessMemoryUsed", ctypes.c_size_t),
+            ("PeakJobMemoryUsed", ctypes.c_size_t),
+        ]
+
+
+class Usage(NamedTuple):
+    """Measured resource usage of a single execution."""
+
+    cpu_seconds: Optional[float]
+    peak_memory_mb: Optional[float]
+
+
+def _memory_ceiling_mb(mle: float) -> int:
+    """Hard OS memory ceiling for one run, well above the judged limit."""
+    wanted = max(mle * MEMORY_SAFETY_FACTOR, MEMORY_SAFETY_MIN_MB)
+    return int(min(wanted, MEMORY_SAFETY_MAX_MB))
+
+
+def _posix_exit_code(status: int) -> int:
+    """Translate a raw wait status into Popen's exit-code convention."""
+    if os.WIFSIGNALED(status):
+        return -os.WTERMSIG(status)
+    if os.WIFEXITED(status):
+        return os.WEXITSTATUS(status)
+    return -1
+
 
 
 def _default_static_flag() -> str:
@@ -134,18 +233,185 @@ def compile_cpp(
     return False, error[:200]
 
 
-def get_uss_mb(pid: int) -> Optional[float]:
-    """Return the USS (unique set size) of a process in MiB, or None.
+def _win32_cpu_seconds(handle: int) -> Optional[float]:
+    """Read user+system CPU seconds from an open process handle."""
+    created = wintypes.FILETIME()
+    exited = wintypes.FILETIME()
+    kernel = wintypes.FILETIME()
+    user = wintypes.FILETIME()
+    if not _kernel32.GetProcessTimes(
+        handle,
+        ctypes.byref(created),
+        ctypes.byref(exited),
+        ctypes.byref(kernel),
+        ctypes.byref(user),
+    ):
+        return None
+    ticks = ((kernel.dwHighDateTime << 32 | kernel.dwLowDateTime)
+             + (user.dwHighDateTime << 32 | user.dwLowDateTime))
+    # FILETIME counts 100-nanosecond intervals; all threads are included.
+    return ticks / 1e7
 
-    USS counts memory owned exclusively by the process, which is much closer
-    to the NOI memory accounting than RSS (which also includes shared libs).
+
+class Meter:
+    """Collects exact CPU time and peak memory for one program execution.
+
+    The handles stay open until after the child exits, because that is the only
+    moment the kernel can report the final totals. On Windows the memory figure
+    is the Job Object's PeakProcessMemoryUsed, i.e. the real high-water mark,
+    which sampling can never reproduce for short allocation bursts.
     """
-    if psutil is None:
-        return None
-    try:
-        return psutil.Process(pid).memory_full_info().uss / 1024 / 1024
-    except Exception:
-        return None
+
+    def __init__(self, memory_ceiling_mb: int) -> None:
+        self.error = ""
+        self._proc_handle = 0
+        self._job_handle = 0
+        self._pid = 0
+        self._last_sampled = 0.0
+        self._posix_usage: Optional[Usage] = None
+        if sys.platform == "win32":
+            self._job_handle = _kernel32.CreateJobObjectW(None, None) or 0
+            if not self._job_handle:
+                self.error = "CreateJobObject failed"
+                return
+            info = _JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
+            info.BasicLimitInformation.LimitFlags = (
+                _JOB_OBJECT_LIMIT_PROCESS_MEMORY | _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+            )
+            info.ProcessMemoryLimit = memory_ceiling_mb * 1024 * 1024
+            if not _kernel32.SetInformationJobObject(
+                self._job_handle,
+                _JOB_OBJECT_EXTENDED_LIMIT_INFORMATION,
+                ctypes.byref(info),
+                ctypes.sizeof(info),
+            ):
+                self.error = "SetInformationJobObject failed"
+
+    def attach(self, pid: int) -> bool:
+        """Bind the running child to this meter."""
+        if self.error:
+            return False
+        if sys.platform != "win32":
+            self._pid = pid
+            return True
+        # Popen returns before the child is guaranteed openable. The window is
+        # microseconds wide, but a few retries keep very short programs from
+        # being reported as evaluator errors.
+        for _ in range(50):
+            self._proc_handle = _kernel32.OpenProcess(
+                _PROCESS_QUERY_LIMITED_INFORMATION | _PROCESS_TERMINATE | _PROCESS_SET_QUOTA,
+                False,
+                pid,
+            )
+            if self._proc_handle:
+                break
+            time.sleep(0.001)
+        if not self._proc_handle:
+            self.error = "OpenProcess failed"
+            return False
+        if not _kernel32.AssignProcessToJobObject(self._job_handle, self._proc_handle):
+            # A process already inside a non-nestable job cannot be reassigned.
+            # Fall back to sampled peaks rather than failing the whole case.
+            self.error = "AssignProcessToJobObject failed"
+            return False
+        return True
+
+    def sample(self, pid: int) -> None:
+        """Record a live memory sample, used only as a last-resort fallback."""
+        if psutil is None:
+            return
+        try:
+            process = psutil.Process(pid)
+            peak = getattr(process.memory_info(), "peak_wset", 0)
+            if peak:
+                self._last_sampled = peak / 1024 / 1024
+            else:
+                self._last_sampled = process.memory_full_info().uss / 1024 / 1024
+        except Exception:
+            pass
+
+    def terminate(self, pid: int) -> None:
+        """Kill the child and anything it spawned (best effort)."""
+        if sys.platform == "win32":
+            if self._proc_handle:
+                _kernel32.TerminateProcess(self._proc_handle, 1)
+            return
+        if not pid:
+            return
+        # The child was started in its own session, so its whole process group
+        # can be signalled at once (a fork bomb or shell pipeline included).
+        # pid 0 would mean this evaluator's own group, hence the guard above.
+        try:
+            os.killpg(os.getpgid(pid), signal.SIGKILL)
+        except Exception:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except Exception:
+                pass
+
+    def poll(self, proc: subprocess.Popen) -> Optional[int]:
+        """Return the exit code once the child has finished, else None.
+
+        POSIX uses wait4 so that the child's own rusage is captured. Popen
+        would otherwise only expose the superprocess-wide cumulative totals.
+        """
+        if sys.platform == "win32":
+            return proc.poll()
+        try:
+            pid, status, usage = os.wait4(proc.pid, os.WNOHANG)
+        except ChildProcessError:
+            return proc.returncode
+        if pid == 0:
+            return None
+        self._posix_usage = Usage(usage.ru_utime + usage.ru_stime, usage.ru_maxrss / 1024)
+        proc.returncode = _posix_exit_code(status)
+        return proc.returncode
+
+    def wait(self, proc: subprocess.Popen) -> int:
+        """Block until the child exits and record its rusage."""
+        if sys.platform == "win32":
+            return proc.wait()
+        try:
+            _, status, usage = os.wait4(proc.pid, 0)
+        except ChildProcessError:
+            return proc.returncode if proc.returncode is not None else -1
+        self._posix_usage = Usage(usage.ru_utime + usage.ru_stime, usage.ru_maxrss / 1024)
+        proc.returncode = _posix_exit_code(status)
+        return proc.returncode
+
+    def finish(self) -> Usage:
+        """Close the handles and return the exact recorded usage."""
+        if sys.platform != "win32":
+            return self._posix_usage or Usage(None, self._last_sampled or None)
+
+        cpu: Optional[float] = None
+        peak: Optional[float] = None
+        if self._proc_handle:
+            cpu = _win32_cpu_seconds(self._proc_handle)
+        if self._job_handle:
+            info = _JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
+            if _kernel32.QueryInformationJobObject(
+                self._job_handle,
+                _JOB_OBJECT_EXTENDED_LIMIT_INFORMATION,
+                ctypes.byref(info),
+                ctypes.sizeof(info),
+                None,
+            ):
+                peak = info.PeakProcessMemoryUsed / 1024 / 1024
+        self.close()
+
+        if peak is None or peak <= 0.0:
+            peak = self._last_sampled or None
+        return Usage(cpu, peak)
+
+    def close(self) -> None:
+        if sys.platform == "win32":
+            if self._proc_handle:
+                _kernel32.CloseHandle(self._proc_handle)
+                self._proc_handle = 0
+            if self._job_handle:
+                _kernel32.CloseHandle(self._job_handle)
+                self._job_handle = 0
 
 
 def run_program(
@@ -168,6 +434,10 @@ def run_program(
         "ERR" - evaluator-side failure
     """
     proc: Optional[subprocess.Popen] = None
+    ceiling_mb = _memory_ceiling_mb(mle)
+    meter = Meter(ceiling_mb)
+    if meter.error:
+        return "ERR", meter.error
     try:
         # Copy the input file into the work dir when the problem expects
         # file-based I/O (e.g., freopen).
@@ -175,7 +445,6 @@ def run_program(
             shutil.copy2(in_file, os.path.join(work_dir, input_name))
 
         # Remove any stale output file produced by a previous run.
-        expected_output = out_file
         if output_name != "-":
             expected_output = os.path.join(work_dir, output_name)
             if os.path.exists(expected_output):
@@ -190,29 +459,74 @@ def run_program(
             # Do NOT use stderr=PIPE here: a program writing lots of debug
             # output to stderr would fill the pipe buffer and block forever,
             # getting misjudged as TLE. DEVNULL discards it safely.
+            #
+            # start_new_session (POSIX) and CREATE_NO_WINDOW (Windows) both
+            # detach the child so the whole tree can be killed on a brake
+            # without a console window flashing up.
+            popen_kwargs = {}
+            if sys.platform == "win32":
+                popen_kwargs["creationflags"] = _CREATE_NO_WINDOW
+            else:
+                popen_kwargs["start_new_session"] = True
+                # Same safety net as the Windows job limit: cap the address
+                # space well above the judged limit so a runaway allocation
+                # cannot take the host down. A verdict never comes from this.
+                ceiling_bytes = ceiling_mb * 1024 * 1024
+
+                def _limit_address_space() -> None:
+                    resource.setrlimit(
+                        resource.RLIMIT_AS, (ceiling_bytes, ceiling_bytes)
+                    )
+
+                popen_kwargs["preexec_fn"] = _limit_address_space
             proc = subprocess.Popen(
                 [os.path.abspath(exe_path)],
                 stdin=fin,
                 stdout=fout,
                 stderr=subprocess.DEVNULL,
                 cwd=work_dir,
+                **popen_kwargs,
+            )
+            meter.attach(proc.pid)
+
+            # The loop is only an emergency brake: a program that sleeps or
+            # blocks burns no CPU, so it would otherwise run forever. Verdicts
+            # are decided below from the exact post-exit measurements.
+            broken_by_brake = False
+            wall_cap = max(tle * WALL_CLOCK_FACTOR, tle + WALL_CLOCK_SLACK_SECONDS)
+            while meter.poll(proc) is None:
+                elapsed = time.time() - start
+                meter.sample(proc.pid)
+                if elapsed > wall_cap:
+                    broken_by_brake = True
+                    meter.terminate(proc.pid)
+                    meter.wait(proc)
+                    break
+                time.sleep(RUN_POLL_INTERVAL_SECONDS)
+
+            usage = meter.finish()
+            cpu = usage.cpu_seconds
+            note = (
+                f"{cpu:.2f}s cpu, {usage.peak_memory_mb:.1f}MB"
+                if cpu is not None and usage.peak_memory_mb is not None
+                else f"{time.time() - start:.2f}s wall"
             )
 
-            # Poll for completion while enforcing TLE and MLE.
-            while proc.poll() is None:
-                elapsed = time.time() - start
-                if elapsed > tle:
-                    proc.kill()
-                    proc.wait()
-                    return "TLE", f"{elapsed:.2f}s"
+            # 1. Memory first: a program killed at the ceiling is already MLE
+            #    even if it also burned a lot of time getting there.
+            if usage.peak_memory_mb is not None and usage.peak_memory_mb > mle:
+                return "MLE", note
 
-                uss_mb = get_uss_mb(proc.pid)
-                if uss_mb is not None and uss_mb > mle:
-                    proc.kill()
-                    proc.wait()
-                    return "MLE", f"{uss_mb:.1f}MB"
+            # 2. CPU time against the limit, exactly like NOI judges. Ties go
+            #    to the judge: exceeding the limit in either direction is TLE.
+            if cpu is not None and cpu > tle:
+                return "TLE", note
 
-                time.sleep(RUN_POLL_INTERVAL_SECONDS)
+            # 3. The brake fired but the program was under both limits — that
+            #    only happens for a genuinely stalled process (deadlock,
+            #    blocking read). Report TLE, since it would never finish.
+            if broken_by_brake:
+                return "TLE", f"{time.time() - start:.2f}s wall, no verdict"
 
             return_code = proc.returncode
             if return_code != 0:
@@ -220,15 +534,20 @@ def run_program(
                 # signal (e.g. SIGSEGV), which is still RE.
                 if return_code < 0:
                     return "RE", f"signal={-return_code}"
+                # Windows reports access violations as a positive NTSTATUS.
+                if sys.platform == "win32" and return_code >= 0xC0000000:
+                    return "RE", f"exception=0x{return_code:x}"
                 return "RE", f"exit={return_code}"
-            return "OK", f"{time.time() - start:.2f}s"
+            return "OK", note
     except Exception as exc:
+        meter.terminate(proc.pid if proc is not None else 0)
         if proc is not None:
             try:
                 proc.kill()
                 proc.wait()
             except Exception:
                 pass
+        meter.close()
         return "ERR", str(exc)[:200]
 
 
@@ -267,9 +586,19 @@ def compare_files(student_output: str, expected_output: str) -> bool:
         return False
 
 
+def exe_file_name(problem_name: str) -> str:
+    """Return the executable name for a problem on this platform.
+
+    g++ on Windows appends .exe to the -o path regardless of what was asked
+    for, so the reported name must carry it; otherwise cleanup misses the file
+    and a stale binary can survive into the next run.
+    """
+    return problem_name + ".exe" if sys.platform == "win32" else problem_name
+
+
 def cleanup_problem_artifacts(prob_dir: str, problem_name: str) -> None:
     """Remove the executable generated during evaluation."""
-    exe_path = os.path.join(prob_dir, problem_name)
+    exe_path = os.path.join(prob_dir, exe_file_name(problem_name))
     try:
         os.remove(exe_path)
     except FileNotFoundError:
@@ -355,8 +684,8 @@ def evaluate_student(
                 print(f"  {p_name}: NO_CPP")
             continue
 
-        # Output executable without .exe for Linux purity
-        exe_path = os.path.join(prob_dir, p_name)
+        # Output executable name for this platform (.exe on Windows).
+        exe_path = os.path.join(prob_dir, exe_file_name(p_name))
         ok, _ = compile_cpp(cpp_path, exe_path, cxx_standard, opt_flags, static_flag)
         if not ok:
             cleanup_problem_artifacts(prob_dir, p_name)
